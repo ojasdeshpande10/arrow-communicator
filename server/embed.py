@@ -22,7 +22,7 @@ class TextDataset(Dataset):
 
 
 def collate_fn(batch):
-    keys =  list(batch[0].keys())
+    keys =  list(batch[0].keys())       
     batch_dict = {key: [d[key] for d in batch] for key in keys}
     padded_batch = {}
     
@@ -90,10 +90,10 @@ class Embedder:
                 # Logging embedding generation 
                 embedding_generation_time += (end_embedding_generation_time-start_embedding_generation_time)
                 
-                hidden_states = outputs.hidden_states
                 # Check for hidden_states to be None
 
                 start_embedding_aggregation_time = time.time()
+                hidden_states = outputs.hidden_states
 
                 selected_layers = [hidden_states[i] for i in layers_to_use]
 
