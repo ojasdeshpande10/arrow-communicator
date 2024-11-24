@@ -3,6 +3,7 @@ from transformers import AutoModel, AutoTokenizer
 import torch
 from torch.utils.data import DataLoader, Dataset
 import time
+import sys
 
 
 class TextDataset(Dataset):
@@ -80,7 +81,7 @@ class Embedder:
         
         with torch.no_grad():
             for batch in dataloader:
-                print(batch['longest_seq'])
+                # print(batch['longest_seq'], flush=True)
                 del batch['longest_seq']
                 batch = {k: v.to("cuda") for k, v in batch.items()}
                 start_embedding_generation_time = time.time()
@@ -97,10 +98,9 @@ class Embedder:
 
                 selected_layers = [hidden_states[i] for i in layers_to_use]
 
-                stacked_layers = torch.stack(selected_layers, dim=0)
+                stacked_layers = torch.stack(selected_layers, dim=0) # (4, batch_size, seq_len, hidden_size)
                 attention_mask = batch['attention_mask'].to("cuda")
-                # (4, batch_size, seq_len, hidden_size)
-                expanded_attention_mask = attention_mask.unsqueeze(0).unsqueeze(-1)
+                expanded_attention_mask = attention_mask.unsqueeze(0).unsqueeze(-1) # (1, batch_size, seq_len, 1)
 
 
 
@@ -109,8 +109,7 @@ class Embedder:
 
                 sum_masked_layers = masked_layers.sum(dim=2)  # shape: (4, batch_size, hidden_size)
 
-                valid_tokens_count = expanded_attention_mask.sum(dim=2)  # shape: (4, batch_size, hidden_size)
-
+                valid_tokens_count = expanded_attention_mask.sum(dim=2)  # shape: (4, batch_size, 1); Last dimension contains num of valid tokens for each document
 
                 mean_layers = sum_masked_layers / valid_tokens_count  # shape: (4, batch_size, hidden_size)
 
@@ -124,6 +123,9 @@ class Embedder:
                 # Logging time for embedding aggregation
                 embedding_aggregation_time += (end_embedding_aggregation_time-start_embedding_aggregation_time)
                 torch.cuda.empty_cache()
+            
+
+            sys.stdout.flush()
                 
 
         result['embeddings'] = all_embeddings

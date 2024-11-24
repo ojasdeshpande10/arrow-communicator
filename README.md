@@ -1,18 +1,36 @@
-# End-2-End Data Transfer for Deep learning(client with HDFS)
+# HDFS Data Transfer with Apache Arrow Flight
 
-## Description
+This repository provides a solution to transfer Parquet files stored on HDFS to another server over the network using Apache Arrow Flight. The setup includes server and client components that handle efficient data transfer, embedding generation, and data retrieval.
 
-This repository contains the code for running an Arrow Flight client which can read tweets from Hadoop File system. It can then transfer these tweets from Apollo server to the Cronus(GPU side), then gets back embeddings and stores them on HDFS
+## Features
 
-## Repository Structure
+- **Apache Arrow Integration**: Transfers data as Arrow tables, utilizing efficient in-memory data representation.
+- **RPC Communication**: Uses `PutRPC` to send data from client to server, followed by embedding generation on the server. `GetRPC` enables the client to retrieve processed embeddings after generation.
+- **Embedding Generation**: Embedding generation starts on the server after receiving data via `PutRPC`.
 
-- `client.py`: This script sets up and runs an Arrow Flight client after preprocessing and batching the data, then makes doGet() and doPut() calls to transfer the tweets and get embeddings back respectively.
+## Folder Structure
 
-## Prerequisites
+- **`server/`**  
+  Contains code to receive data from the client, read Parquet files as Arrow tables, and perform embedding generation after data transfer.
 
-- Python 3.8 or higher
-- Apache Arrow
-- Arrow Flight
-- NumPy
-- Hugging Face
-- PyTorch
+- **`client/`**  
+  Initiates `PutRPC` to transfer data to the server and executes `GetRPC` to retrieve embeddings once generation is complete on the server.
+
+## Quick Start
+
+1. **Client Setup**  
+   - Navigate to `client/`.
+   - Run the client to send data to the server using `PutRPC`.
+
+2. **Server Setup**  
+   - Navigate to `server/`.
+   - The server receives the data, performs embedding generation, and makes processed data available for retrieval.
+
+3. **Data Retrieval**  
+   - The client executes `GetRPC` to retrieve the generated embeddings from the server.
+
+## Requirements
+
+- Apache Arrow Flight
+- HDFS
+- Parquet libraries
