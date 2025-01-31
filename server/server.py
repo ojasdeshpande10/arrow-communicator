@@ -5,24 +5,13 @@ from embed import Embedder
 import time
 import numpy as np
 import sys
+from dlatk_embed import MessageEmbedder
+from embed import Embedder
+import threading 
+import queue
+import os
+os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512,expandable_segments:True"
 
-def setup_logger(log_file):
-    """
-    Redirects print statements to both terminal and a log file.
-    """
-    class Logger(object):
-        def __init__(self):
-            self.terminal = sys.stdout
-            self.log = open(log_file, "a")  # Open the log file in append mode
-
-        def write(self, message):
-            self.terminal.write(message)  # Print to terminal
-            self.log.write(message)  # Write to log file
-
-        def flush(self):
-            pass  # This allows for the compatibility of Python 3 print statements
-
-    sys.stdout = Logger()  # Redirect print output to both terminal and file
 
 
 
@@ -30,66 +19,87 @@ class MyFlightServer(flight.FlightServerBase):
 
     def __init__(self, location, **kwargs):
         super().__init__(location, **kwargs)
+        self.incoming_data_queue = queue.Queue()
+        self.embedded_data = {}
+        worker = threading.Thread(target=self._embedding_worker, daemon=True)
+        worker.start()
+       
         self.embeddings= None  # Instance variable to store embeddings
         self.embeddingcompletion = False
-        self.tokenization_time = 0
-        self.embedding_generation_time = 0
-        self.embedding_aggregation_time = 0
         self.embedding_total_time = 0
         self.network_time_to_cronus = 0
         self.data_loading_time = 0
         self.network_time = 0
         self.messages = 0
-        self.embedder = Embedder("roberta-large")
-        # using last 4 layers
-        self.layers_to_use = [-4,-3,-2,-1]
+        # self.embedder = MessageEmbedder("roberta-large")  
+        self.embedder = Embedder("roberta-large")  
 
+    def _embedding_worker(self):
+
+        while True:
+            batch_id, table = self.incoming_data_queue.get()  # block until new data
+            # Check for exit condition if needed (not shown)
+            print(f"Worker: Embedding for batch_id={batch_id} started...")
+            
+            message_id = table.column('message_id').to_pylist()
+            text_data = table.column('message').to_pylist()
+            # combined_list = [[mid, text] for mid, text in zip(message_id, text_data)]
+            start_embedding_time = time.time()
+            print("starting to embed")
+            # result = self.embedder.get_embeddings(combined_list)
+            result = self.embedder.embed(text_data, [-4, -3, -2, -1])
+            end_embedding_time = time.time()
+            # self.embeddings = result
+            
+            # Store the final embedded table in self.embedded_data
+            self.embedded_data[batch_id] = result
+            print(f"Worker: Embedding for batch_id={batch_id} done!")
+         
     def getEmbeddings(self, table):
 
         # function to generate embeddings
-
+        message_id = table.column('message_id').to_pylist()
         text_data = table.column('message').to_pylist()
+        combined_list = [[mid, text] for mid, text in zip(message_id, text_data)]
         start_embedding_time = time.time()
-        result = self.embedder.embed(text_data, self.layers_to_use)
+        print("starting to embed")
+        result = self.embedder.get_embeddings(combined_list)
         end_embedding_time = time.time()
-        self.embeddings = result['embeddings']
+        self.embeddings = result
+        print("time taken to embed : ", end_embedding_time-start_embedding_time)
 
-        # Logging Embedding time
-        self.embedding_total_time += end_embedding_time - start_embedding_time
-        self.tokenization_time += result['tokenization-time']
-        self.embedding_generation_time += result['embedding-generation_time']
-        self.embedding_aggregation_time += result['embedding-aggregation_time']
-        self.data_loading_time += result['data-loading_time']
-        if self.messages % 1000000 == 0:
-            print("Number of messages : ", self.messages)
-            print("Network Time Apollo to Cronus : ", self.network_time)
-            print("Embedding Total Time : ",self.embedding_total_time)
-            print("Tokenization time : ", self.tokenization_time)
-            print("Embedding Generation time : ", self.embedding_generation_time)
-            print("Embedding Aggregation time : ", self.embedding_aggregation_time)
-            print("Data loading time : ", self.data_loading_time)
         
-
     def do_put(self, context, descriptor, reader, writer):
         
         # Logging network time to recieve data from apollo
-        start_network_time = time.time()
+        if descriptor.path:
+            print(descriptor.path[0].decode())
+            batch_id = descriptor.path[0].decode()
         self.table = reader.read_all()
-        end_network_time = time.time()
-        self.network_time += (end_network_time - start_network_time)
         self.messages += self.table.num_rows
-        self.getEmbeddings(self.table)
+        print(self.table.num_rows)
+        self.incoming_data_queue.put((batch_id, self.table))
+        print("the Data is put in  the queue")
     
     def do_get(self, context, ticket):
 
-        # adding embeddings to the table
-        updated_table = self.table.append_column('embedding', pa.array(self.embeddings))
+        batch_id = ticket.ticket.decode("utf-8")
+        if batch_id not in self.embedded_data:
+            # Could raise an error if not ready:
+            # raise flight.FlightServerError("Embeddings not ready.")
+            # Or return an empty table to indicate "not done yet."
+            empty_table = pa.Table.from_arrays([], names=[])
+            return flight.RecordBatchStream(empty_table)
+
+        # If ready, return the embedded table
+        updated_table = self.table.append_column('embedding', pa.array(self.embedded_data[batch_id]))
+        del self.embedded_data[batch_id]
         return flight.RecordBatchStream(updated_table)
+        # adding embeddings to the table
+        
+        return flight.RecordBatchStream()
 
 def start_server():
-
-    log_file = "/home/odeshpande/arrow-communicator/log_file_server.txt"
-    setup_logger(log_file)
     server = MyFlightServer(('0.0.0.0', 5111))  # Listen on all interfaces
     print("Starting server on port 5111")
     server.serve()

@@ -4,6 +4,7 @@ import torch
 from torch.utils.data import DataLoader, Dataset
 import time
 import sys
+from tqdm import tqdm
 
 
 class TextDataset(Dataset):
@@ -60,10 +61,100 @@ class Embedder:
             device = torch.device("cuda:0") 
             self.model.to(device)
             self.model = self.model.half()
+    def embed_longer(self,texts:List[str], layers_to_use:List[int],  max_chunk_length=510, batch_size=256):
+        all_embeddings = []
+        cls_token_id = self.tokenizer.cls_token_id
+        sep_token_id = self.tokenizer.sep_token_id
 
+        # Step 1: Tokenize all messages and split them into chunks
+        all_chunks = []
+        message_chunk_indices = []
+
+        start_time_tokenizing = time.time()
+        for message_idx, message in enumerate(texts):
+            tokenized_output = self.tokenizer(message, add_special_tokens=False)
+
+            input_ids = tokenized_output["input_ids"]
+            if len(input_ids)>512:
+                print(len(input_ids))
+            attention_mask = tokenized_output["attention_mask"]
+
+            input_id_chunks = [input_ids[i:i + max_chunk_length] for i in range(0, len(input_ids), max_chunk_length)]
+            attention_mask_chunks = [attention_mask[i:i + max_chunk_length] for i in range(0, len(attention_mask), max_chunk_length)]
+
+            chunks = [
+                {
+                    "input_ids": [cls_token_id] + chunk + [sep_token_id],
+                    "attention_mask": [1] + mask + [1],
+                    "message_idx": message_idx
+                }
+                for chunk, mask in zip(input_id_chunks, attention_mask_chunks)
+            ]
+
+            all_chunks.extend(chunks)
+            message_chunk_indices.extend([message_idx] * len(chunks))
+        end_time_tokenizing = time.time()
+        # Step 2: Process chunks in batches
+        def collate_chunks(chunks):
+            max_len = max(len(chunk["input_ids"]) for chunk in chunks)
+            input_ids = []
+            attention_masks = []
+            message_indices = []
+
+            for chunk in chunks:
+                ids = chunk["input_ids"]
+                mask = chunk["attention_mask"]
+                padding_length = max_len - len(ids)
+
+                input_ids.append(ids + [self.tokenizer.pad_token_id] * padding_length)
+                attention_masks.append(mask + [0] * padding_length)
+                message_indices.append(chunk["message_idx"])
+
+            return {
+                "input_ids": torch.tensor(input_ids, device="cuda"),
+                "attention_mask": torch.tensor(attention_masks, device="cuda"),
+                "message_indices": message_indices
+            }
+
+        # Step 3: Batch processing
+        chunk_embeddings_dict = {}
+
+        for i in range(0, len(all_chunks), batch_size):
+            batch_chunks = all_chunks[i:i + batch_size]
+            batch = collate_chunks(batch_chunks)
+
+            model_inputs = {k: v for k, v in batch.items() if k in ["input_ids", "attention_mask"]}
+            message_indices = batch["message_indices"]
+
+            with torch.no_grad():
+                outputs = self.model(**model_inputs, output_hidden_states=True)
+                hidden_states = torch.stack([outputs.hidden_states[i] for i in layers_to_use], dim=0)  # Shape: (4, batch_size, seq_length, hidden_size)
+                attention_mask = batch['attention_mask'].unsqueeze(0).unsqueeze(-1)  # Shape: (1, batch_size, seq_length, 1)
+                masked_hidden_states = hidden_states * attention_mask  # Zero-out padded tokens
+
+                # Average over valid tokens
+                sum_hidden_states = masked_hidden_states.sum(dim=2)  # Shape: (4, batch_size, hidden_size)
+                valid_tokens_count = attention_mask.sum(dim=2)  # Shape: (1, batch_size, 1)
+                mean_hidden_states = sum_hidden_states / valid_tokens_count  # Shape: (4, batch_size, hidden_size)
+
+                chunk_embeddings = mean_hidden_states.permute(1, 0, 2)  # Shape: (batch_size, 4, hidden_size)
+
+            # Store embeddings by message index
+            for idx, message_idx in enumerate(message_indices):
+                if message_idx not in chunk_embeddings_dict:
+                    chunk_embeddings_dict[message_idx] = []
+                chunk_embeddings_dict[message_idx].append(chunk_embeddings[idx])
+
+        # Step 4: Aggregate chunk embeddings for each message
+        for message_idx in range(len(texts)):
+            message_chunks = chunk_embeddings_dict[message_idx]
+            message_embedding = torch.stack(message_chunks).mean(dim=0)  # Average the chunk embeddings
+            all_embeddings.append(message_embedding.cpu().tolist())
+        result = {}
+        result['embeddings'] = all_embeddings
+        return result
     
     def embed(self, texts:List[str], layers_to_use:List[int]):
-        
         result = {}
         # tokenizing the texts 
         start_time_tokenizing = time.time()
@@ -80,7 +171,7 @@ class Embedder:
         all_embeddings=[]
         
         with torch.no_grad():
-            for batch in dataloader:
+            for batch in tqdm(dataloader):
                 # print(batch['longest_seq'], flush=True)
                 del batch['longest_seq']
                 batch = {k: v.to("cuda") for k, v in batch.items()}
@@ -128,10 +219,10 @@ class Embedder:
             sys.stdout.flush()
                 
 
-        result['embeddings'] = all_embeddings
-        result['tokenization-time'] = (end_time_tokenizing-start_time_tokenizing)
-        result['data-loading_time'] = (data_loading_time_end-data_loading_time_start)
-        result['embedding-generation_time'] = embedding_generation_time
-        result['embedding-aggregation_time'] = embedding_aggregation_time
+        # result['embeddings'] = all_embeddings
+        # result['tokenization-time'] = (end_time_tokenizing-start_time_tokenizing)
+        # result['data-loading_time'] = (data_loading_time_end-data_loading_time_start)
+        # result['embedding-generation_time'] = embedding_generation_time
+        # result['embedding-aggregation_time'] = embedding_aggregation_time
 
-        return result
+        return all_embeddings
