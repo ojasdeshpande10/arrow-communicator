@@ -17,6 +17,10 @@ import pandas as pd
 import pyarrow.compute as pc
 import pyarrow.parquet as pq
 from tqdm import tqdm
+from pyarrow import csv
+import threading
+import queue
+
 
 import sys
 
@@ -42,7 +46,7 @@ class MyFlightClient(flight.FlightClient):
         """
         super().__init__(f'grpc://{server_address}:{port}')
 
-    def sendpyarrow(self, input_table):
+    def sendpyarrow(self, input_table, batch_num):
         """
         Sends a PyArrow table to the server using Arrow Flight.
 
@@ -52,28 +56,42 @@ class MyFlightClient(flight.FlightClient):
         Raises:
             flight.FlightError: If the data could not be sent to the server.
         """
+        batch_id = f"batch_{batch_num:06d}"
         table = input_table
         # descriptor will act as the ID for the data stream being sent
-        descriptor = flight.FlightDescriptor.for_path("example_path")
+        descriptor = flight.FlightDescriptor.for_path(batch_id)
         writer, _ = self.do_put(descriptor, table.schema)
         writer.write_table(table)
         writer.close()
         
-    def fetch_data_from_server(self, filesystem, filepath):
+    def fetch_data_from_server(self, filesystem, filepath,batch_num):
         # Create a ticket for the data you want. The content can be anything that your server understands.
         result = {}
-        start_network_time = time.time()
-        ticket = flight.Ticket('data_request_ticket')
+        batch_id = f"batch_{batch_num:06d}"
+        while True:
+            ticket = flight.Ticket(batch_id.encode("utf-8"))
+            start_network_time = time.time()
+            reader = self.do_get(ticket)
+            result_table = reader.read_all()
+            end_network_time = time.time()
+            if result_table.num_rows == 0 or "embedding" not in result_table.schema.names:
+                time.sleep(20)
+            else:
+                print(f"Client: Received embedded table with columns: {result_table.schema.names}")
+                # print(result_table)
+                break
+        # result = {}
+        # start_network_time = time.time()
+        # ticket = flight.Ticket('data_request_ticket')
         # Request the data
-        reader = self.do_get(ticket)
+        # reader = self.do_get(ticket)
         # Read the data into a PyArrow Table
-        table = reader.read_all()
-        updated_table = table.drop(['created_at'])
-        end_network_time = time.time()
+        # table = reader.read_all()
+        # end_network_time = time.time()
         
         # Writing the part to the destination folder
         start_write_hdfs_time = time.time()
-        pq.write_table(updated_table, filepath, filesystem=filesystem)
+        pq.write_table(result_table, filepath, filesystem=filesystem)
         end_write_hdfs_time = time.time()
 
         result['write-time'] = end_write_hdfs_time - start_write_hdfs_time
@@ -191,26 +209,46 @@ def main(args):
         IOError: If there is an issue reading or writing data to HDFS.
     """
     start_time = time.time()
-    print("GRPC_MAX_METADATA_SIZE:", os.getenv('GRPC_MAX_METADATA_SIZE'))
-    print("GRPC_MAX_SEND_MESSAGE_LENGTH:", os.getenv('GRPC_MAX_SEND_MESSAGE_LENGTH'))
-    print("GRPC_MAX_RECEIVE_MESSAGE_LENGTH:", os.getenv('GRPC_MAX_RECEIVE_MESSAGE_LENGTH'))
-    
+    # print("GRPC_MAX_METADATA_SIZE:", os.getenv('GRPC_MAX_METADATA_SIZE'))
+    # print("GRPC_MAX_SEND_MESSAGE_LENGTH:", os.getenv('GRPC_MAX_SEND_MESSAGE_LENGTH'))
+    # print("GRPC_MAX_RECEIVE_MESSAGE_LENGTH:", os.getenv('GRPC_MAX_RECEIVE_MESSAGE_LENGTH'))
     os.environ['ARROW_LIBHDFS_DIR'] = '/home/hlab-admin/hadoop/lib/native/libhdfs.so'
     os.environ['CLASSPATH'] = os.popen('hadoop classpath --glob').read().strip()
     hdfs = pafs.HadoopFileSystem(host='hdfs://apollo-d0', port=9000)
-    print("Batch : ",args.input_path)
-    
-    try:
-        read_time_start = time.time()
-        dataset = pq.ParquetDataset(args.input_path, filesystem=hdfs)
-        table = dataset.read()
-        read_time_end = time.time()
-        print("The column names are: ", table.schema.names)
-        print("Number of rows: ", table.num_rows)
-        print("Number of columns: ", table.num_columns)
-    except Exception as e:
-        print("Error in reading the data: ", e)
-        return
+    print("Batch : ",args.input_path)       
+
+    if args.file_type == "parquet":
+        try:
+            read_time_start = time.time()
+            dataset = pq.ParquetDataset(args.input_path, filesystem=hdfs)
+            table = dataset.read()
+            read_time_end = time.time()
+            print("The column names are: ", table.schema.names)
+            table = table.drop(['created_at', 'location', 'coordinates'])
+            print("The column names are: ", table.schema.names)
+            print("Number of rows: ", table.num_rows)
+            print("Number of columns: ", table.num_columns)
+        except Exception as e:
+            print("Error in reading the data: ", e)
+            return
+    else:
+        try:
+            read_time_start = time.time()
+
+            with hdfs.open_input_file(args.input_path) as file:
+            # Read the CSV into an Arrow Table
+                table = csv.read_csv(file)
+            if table:
+                # print("Read time: {:.2f} seconds".format(read_time_end - read_time_start))
+                print("The column names are: ", table.column_names)
+                print("Number of rows: ", table.num_rows)
+                print("Number of columns: ", table.num_columns)
+            else:
+                print("No CSV files found in the directory.")
+
+        except Exception as e:
+            print("Error in reading the data: ", e)
+            return
     
 
     # Filtering already embedded message_ids
@@ -222,32 +260,28 @@ def main(args):
     # Limiting table for testing
     if args.limit > 0:
         table = table.slice(0, args.limit)
-
     i = file_number
     write_time = 0
     network_time2 = 0
-    sending_time = 0
     myclient = MyFlightClient(server_address=args.server_address, port=args.port)
     total_messages = 0
     total_batches = (table.num_rows + args.batch_size - 1) // args.batch_size
+    batch_num = 0
 
     for batch in tqdm(batch_table(table, args.batch_size), total=total_batches):
-        start_time_batch = time.time()
         total_messages += batch.num_rows 
         # Sending data to the server for generating embedding
-        myclient.sendpyarrow(batch)
+        myclient.sendpyarrow(batch, batch_num)
         filepath = f'{args.output_path}/part{str(i)}.parquet'
-        start_get_time = time.time()
-        result = myclient.fetch_data_from_server(hdfs, filepath)
-        end_get_time = time.time()
+        result = myclient.fetch_data_from_server(hdfs, filepath, batch_num)
+
         write_time += result['write-time']
         network_time2 += result['network_cronus_to_apollo']
+        print("network time from cronus to apollo : ", result['network_cronus_to_apollo'])
+        print("write time to HDFS : ", result['write-time'])
         total_messages += args.batch_size
-
-        if total_messages % 1000000 == 0:
-            print("Write Time : ", write_time)
-            print("Network Time : ", network_time2)
         i += 1
+        batch_num += 1
 
     print("Read Time : ", read_time_end - read_time_start)
     print("Write Time : ", write_time)
@@ -265,6 +299,7 @@ if __name__ == "__main__":
     parser.add_argument("--port", type=int, default=5111, help="Flight server port")
     parser.add_argument("--batch_size", type=int, default=100000, help="Batch size for processing")
     parser.add_argument("--limit", type=int, default=0, help="Limit the number of rows for testing (0 for no limit)")
+    parser.add_argument("--file_type", type=str, default="parquet", help="Batch size for processing")
     args = parser.parse_args()
     
     main(args)
