@@ -1,20 +1,18 @@
 # server.py
 import pyarrow.flight as flight
 import pyarrow as pa
-from embed import Embedder
+
 import time
 import numpy as np
 import sys
 from dlatk_embed import MessageEmbedder
-from embed import Embedder
+from embed_opti import Embedder
+from emb_mxbai import UniversalEmbedder
 import threading 
 import queue
 import os
 import argparse
-os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512,expandable_segments:True"
-
-
-
+# os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "max_split_size_mb:512,expandable_segments:True"
 
 class MyFlightServer(flight.FlightServerBase):
 
@@ -31,11 +29,13 @@ class MyFlightServer(flight.FlightServerBase):
         self.data_loading_time = 0
         self.network_time = 0
         self.messages = 0 
-
+        # self.embedder1 = Embedder("roberta-large")
+        self.sent_transformer = UniversalEmbedder("mixedbread-ai/mxbai-embed-large-v1")
+        # self.embedder1 = Embedder("roberta-large") # for backward compatibility with the old embedder 
+        # self.embedder_Mat = MixedbreadEmbedder(pooling="mean", trunc_dim=256)
     def _embedding_worker(self):
 
         while True:
-            self.embedder = MessageEmbedder("roberta-large")  
             batch_id, table = self.incoming_data_queue.get()  # block until new data
             # Check for exit condition if needed (not shown)
             print(f"Worker: Embedding for batch_id={batch_id} started...")
@@ -45,13 +45,15 @@ class MyFlightServer(flight.FlightServerBase):
             combined_list = [[mid, text] for mid, text in zip(message_id, text_data)]
             start_embedding_time = time.time()
             print("starting to embed")
-            result = self.embedder.get_embeddings(combined_list)
-            # result = self.embedder.embed(text_data, [-4, -3, -2, -1])
+            # result = self.embedder.get_embeddings_torch(combined_list)
+            # result = self.embedder1.embed(text_data, [-4, -3, -2, -1])
+            result = self.sent_transformer.embed(text_data)
+            # result = self.embedder_Mat.embed(text_data)
             end_embedding_time = time.time()
             # self.embeddings = result
             
             # Store the final embedded table in self.embedded_data
-            self.embedded_data[batch_id] = result
+            self.embedded_data[batch_id] = result["embeddings"]
             print(f"Worker: Embedding for batch_id={batch_id} done!")
          
     def getEmbeddings(self, table):
@@ -81,7 +83,6 @@ class MyFlightServer(flight.FlightServerBase):
         print("the Data is put in  the queue")
     
     def do_get(self, context, ticket):
-
         batch_id = ticket.ticket.decode("utf-8")
         if batch_id not in self.embedded_data:
             # Could raise an error if not ready:
